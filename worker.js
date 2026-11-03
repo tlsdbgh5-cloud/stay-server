@@ -64,10 +64,10 @@ export class Room {
     this.dbTimer = null;
     this.dbDirty = new Set();
     this.lastAdd = new Map();   // uid -> time
-    this.db = { notes: [], stories: [] };
+    this.db = { notes: [], stories: [], lamps: [] };
     state.blockConcurrencyWhile(async () => {
       const d = await state.storage.get("db");
-      if (d) this.db = { notes: d.notes || [], stories: d.stories || [] };
+      if (d) this.db = { notes: d.notes || [], stories: d.stories || [], lamps: d.lamps || [] };
     });
   }
 
@@ -87,7 +87,7 @@ export class Room {
     const snap = [];
     this.conns.forEach((o) => { if (o !== c && o.pres) snap.push(JSON.stringify(o.id) + ":" + o.pres); });
     this.send(c, '{"t":"snap","p":{' + snap.join(",") + "}}");
-    this.sendDb(c, "notes"); if (world === "nurse2") this.sendDb(c, "stories");
+    this.sendDb(c, "notes"); if (world === "nurse2") { this.sendDb(c, "stories"); this.sendDb(c, "lamps"); }
     server.addEventListener("message", (ev) => this.onMessage(c, ev.data));
     const drop = () => this.drop(c);
     server.addEventListener("close", drop);
@@ -113,9 +113,10 @@ export class Room {
   }
 
   onMessage(c, raw) {
-    if (typeof raw !== "string" || raw.length > 2000) return;
+    if (typeof raw !== "string" || raw.length > 16000) return;
     let m; try { m = JSON.parse(raw); } catch (e) { return; }
     if (!m || typeof m.t !== "string") return;
+    if (raw.length > 2000 && !(m.t === "add" && m.c === "lamps")) return;
     this.refill(c);
     if (m.t === "p") {
       if (c.pTok < 1) return; c.pTok--;
@@ -135,6 +136,15 @@ export class Room {
       this.conns.forEach((o) => { if (o !== c) this.send(o, out); });
     } else if (m.t === "add" || m.t === "upd" || m.t === "del") {
       this.onDb(c, m);
+    } else if (m.t === "ph") {
+      if (c.eTok < 1) return; c.eTok--;
+      this.sendPhoto(c, String(m.id || ""));
+    } else if (m.t === "rep") {
+      if (c.eTok < 1) return; c.eTok--;
+      this.report(c, String(m.id || ""));
+    } else if (m.t === "cl" || m.t === "ch" || m.t === "chd") {
+      if (c.world !== "nurse2" || c.eTok < 1) return; c.eTok--;
+      this.onCheer(c, m);
     }
   }
 
@@ -168,13 +178,78 @@ export class Room {
       this.pending.clear(); this.gone = [];
     }
     if (this.tickN % 80 === 0) this.conns.forEach((o) => this.send(o, '{"t":"k"}'));   // keep-alive
+    if (this.tickN % 200 === 0 && this.sweepLamps()) this.markDb("lamps");
   }
 
   // ---- boards ----
   sendDb(c, coll) {
-    const docs = (this.db[coll] || []).slice().sort((a, b) => b.at - a.at).slice(0, coll === "notes" ? 400 : 100)
-      .map((d) => { const o = { ...d }; delete o.hb; return o; });
+    const mask = (d) => ({ ...d, by: d.by === c.uid ? c.uid : "" });
+    let docs;
+    if (coll === "lamps") {
+      const now = Date.now();
+      docs = (this.db.lamps || []).filter((d) => d.until > now)
+        .map((d) => ({ id: d.id, text: d.text, name: d.name, at: d.at, until: d.until, slot: d.slot, hugs: d.hugs || 0, ph: !!d.ph, by: d.by === c.uid ? c.uid : "" }));
+    } else {
+      docs = (this.db[coll] || []).slice().sort((a, b) => b.at - a.at).slice(0, coll === "notes" ? 400 : 100)
+        .map((d) => { const o = mask(d); delete o.hb; return o; });
+    }
     this.send(c, JSON.stringify({ t: "db", c: coll, docs }));
+  }
+  err(c, coll, m) { this.send(c, JSON.stringify({ t: "err", c: coll, m })); }
+  dropLampData(d) {
+    if (d.ph) this.state.storage.delete("ph:" + d.id).catch(() => {});
+    this.state.storage.delete("ch:" + d.id).catch(() => {});
+  }
+  async onCheer(c, m) {
+    const id = String(m.id || ""), l = (this.db.lamps || []).find((x) => x.id === id && x.until > Date.now());
+    if (!l) return;
+    const key = "ch:" + id;
+    let arr = []; try { arr = (await this.state.storage.get(key)) || []; } catch (e) {}
+    const view = () => JSON.stringify({ t: "cl", id, d: arr.map((x) => ({ k: x.k, t: x.t, n: x.n, at: x.at })) });
+    if (m.t === "cl") { this.send(c, view()); return; }
+    if (m.t === "chd") {
+      if (l.by !== c.uid) return;
+      const n = arr.length; arr = arr.filter((x) => x.k !== String(m.k || ""));
+      if (arr.length === n) return;
+      await this.state.storage.put(key, arr).catch(() => {});
+      l.hugs = arr.length; this.markDb("lamps"); this.send(c, view());
+      return;
+    }
+    // ch: leave one short cheering message on someone else's lamp
+    const now = Date.now();
+    if (l.by === c.uid) { this.err(c, "cheer", "own"); return; }
+    if (now - (this.lastAdd.get("ch" + c.uid) || 0) < 6000) { this.err(c, "cheer", "slow"); return; }
+    const text = clean(m.text, 40);
+    if (!text || bad(text)) { this.err(c, "cheer", "bad"); return; }
+    if (arr.some((x) => x.u === c.uid)) { this.err(c, "cheer", "dup"); return; }
+    if (arr.length >= 40) { this.err(c, "cheer", "full"); return; }
+    arr.push({ k: rid(), t: text, n: clean(m.name, 12) || "익명", at: now, u: c.uid });
+    this.lastAdd.set("ch" + c.uid, now);
+    await this.state.storage.put(key, arr).catch(() => {});
+    l.hugs = arr.length; this.markDb("lamps"); this.send(c, view());
+  }
+  sweepLamps() {
+    const now = Date.now(), keep = [], drop = [];
+    (this.db.lamps || []).forEach((d) => (d.until > now ? keep : drop).push(d));
+    if (!drop.length) return false;
+    this.db.lamps = keep;
+    drop.forEach((d) => this.dropLampData(d));
+    return true;
+  }
+  async sendPhoto(c, id) {
+    const d = (this.db.lamps || []).find((x) => x.id === id && x.ph);
+    let data = null;
+    if (d) { try { data = (await this.state.storage.get("ph:" + id)) || null; } catch (e) {} }
+    this.send(c, JSON.stringify({ t: "ph", id, d: data }));
+  }
+  report(c, id) {
+    const d = (this.db.lamps || []).find((x) => x.id === id);
+    if (!d || !d.ph || d.by === c.uid) return;
+    d.rp = d.rp || [];
+    if (d.rp.includes(c.uid)) return;
+    d.rp.push(c.uid);
+    if (d.rp.length >= 3) { d.ph = false; this.state.storage.delete("ph:" + id).catch(() => {}); }
+    this.markDb("lamps");
   }
   markDb(coll) {
     this.dbDirty.add(coll);
@@ -186,11 +261,37 @@ export class Room {
       colls.forEach((cl) => this.conns.forEach((o) => { if (cl === "notes" || o.world === "nurse2") this.sendDb(o, cl); }));
     }, 500);
   }
+  onLamp(c, m, now) {
+    this.sweepLamps();
+    const list = this.db.lamps;
+    if (m.t === "add") {
+      const d = m.d || {};
+      if (now - (this.lastAdd.get("lamp" + c.uid) || 0) < 15000) { this.err(c, "lamps", "slow"); return; }
+      const text = String(d.text == null ? "" : d.text).replace(/[\u0000-\u0009\u000b-\u001f<>]/g, " ").replace(/\n{3,}/g, "\n\n").trim().slice(0, 100);
+      if (!text || bad(text)) { this.err(c, "lamps", "bad"); return; }
+      const oi = list.findIndex((x) => x.by === c.uid);
+      if (oi >= 0) { const o = list[oi]; list.splice(oi, 1); this.dropLampData(o); }
+      const used = new Set(list.map((x) => x.slot));
+      let slot = -1;
+      for (let i = 0; i < 100; i++) if (!used.has(i)) { slot = i; break; }
+      if (slot < 0) { this.err(c, "lamps", "full"); return; }
+      const photo = typeof d.photo === "string" && d.photo.length <= 14000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(d.photo) ? d.photo : null;
+      const id = rid() + now.toString(36);
+      if (photo) this.state.storage.put("ph:" + id, photo).catch(() => {});
+      list.push({ id, text, name: clean(d.name, 12) || "익명", at: now, until: now + 7 * 86400000, slot, hugs: 0, by: c.uid, ph: !!photo, hb: [], rp: [] });
+      this.lastAdd.set("lamp" + c.uid, now);
+      this.markDb("lamps");
+    } else if (m.t === "del") {
+      const i = list.findIndex((x) => x.id === m.id);
+      if (i >= 0 && list[i].by === c.uid) { const o = list[i]; list.splice(i, 1); this.dropLampData(o); this.markDb("lamps"); }
+    }
+  }
   onDb(c, m) {
     const coll = m.c;
-    if (coll !== "notes" && !(coll === "stories" && c.world === "nurse2")) return;
+    if (coll !== "notes" && !((coll === "stories" || coll === "lamps") && c.world === "nurse2")) return;
     const list = this.db[coll];
     const now = Date.now();
+    if (coll === "lamps") { this.onLamp(c, m, now); return; }
     if (m.t === "add") {
       const d = m.d || {};
       const gap = coll === "notes" ? 12000 : 45000;
