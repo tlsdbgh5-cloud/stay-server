@@ -1,6 +1,7 @@
 // Stay realtime server: one Durable Object per world ("room").
 // It relays positions and small events, and keeps the note/story boards of that world.
-const WORLDS = ["nurse2", "cafe"];
+const WORLDS = ["nurse2", "nurse3", "cafe"];
+const isMom = (w) => w === "nurse2" || w === "nurse3";   // 엄마방 and 엄마방2: separate rooms, same rules
 const MAX_PER_ROOM = 120;
 const TOPICS = new Set(["busk", "bow", "clap", "cheers", "chat", "pet", "firework", "log", "pour", "lantern"]);
 const NOTE_COLORS = new Set(["yellow", "pink", "mint", "sky", "lilac"]);
@@ -87,7 +88,7 @@ export class Room {
     const snap = [];
     this.conns.forEach((o) => { if (o !== c && o.pres) snap.push(JSON.stringify(o.id) + ":" + o.pres); });
     this.send(c, '{"t":"snap","p":{' + snap.join(",") + "}}");
-    this.sendDb(c, "notes"); if (world === "nurse2") { this.sendDb(c, "stories"); this.sendDb(c, "lamps"); }
+    this.sendDb(c, "notes"); if (isMom(world)) { this.sendDb(c, "stories"); this.sendDb(c, "lamps"); }
     server.addEventListener("message", (ev) => this.onMessage(c, ev.data));
     const drop = () => this.drop(c);
     server.addEventListener("close", drop);
@@ -143,7 +144,7 @@ export class Room {
       if (c.eTok < 1) return; c.eTok--;
       this.report(c, String(m.id || ""));
     } else if (m.t === "cl" || m.t === "ch" || m.t === "chd") {
-      if (c.world !== "nurse2" || c.eTok < 1) return; c.eTok--;
+      if (!isMom(c.world) || c.eTok < 1) return; c.eTok--;
       this.onCheer(c, m);
     }
   }
@@ -157,6 +158,7 @@ export class Room {
       lamp: Array.isArray(d.lamp) && d.lamp.length === 2 ? [num(d.lamp[0], -100, 100, 0), num(d.lamp[1], -100, 100, 0)] : null,
       name: clean(d.name, 12), msg: clean(d.msg, 30),
       mom: typeof d.mom === "string" ? clean(d.mom, 16) : null, face: typeof d.face === "string" ? clean(d.face, 16) : undefined,
+      look: Array.isArray(d.look) && d.look.length === 3 && d.look.every((v) => Number.isInteger(v) && v >= 0 && v < 10) ? d.look : null,
       bacc: Number.isInteger(d.bacc) ? d.bacc & 7 : 0, foc: d.foc === 2 ? 2 : d.foc === 1 ? 1 : 0,
     };
     if (bad(o.name)) o.name = ""; if (bad(o.msg)) o.msg = "";
@@ -258,7 +260,7 @@ export class Room {
       this.dbTimer = null;
       const colls = [...this.dbDirty]; this.dbDirty.clear();
       try { await this.state.storage.put("db", this.db); } catch (e) {}
-      colls.forEach((cl) => this.conns.forEach((o) => { if (cl === "notes" || o.world === "nurse2") this.sendDb(o, cl); }));
+      colls.forEach((cl) => this.conns.forEach((o) => { if (cl === "notes" || isMom(o.world)) this.sendDb(o, cl); }));
     }, 500);
   }
   onLamp(c, m, now) {
@@ -288,7 +290,7 @@ export class Room {
   }
   onDb(c, m) {
     const coll = m.c;
-    if (coll !== "notes" && !((coll === "stories" || coll === "lamps") && c.world === "nurse2")) return;
+    if (coll !== "notes" && !((coll === "stories" || coll === "lamps") && isMom(c.world))) return;
     const list = this.db[coll];
     const now = Date.now();
     if (coll === "lamps") { this.onLamp(c, m, now); return; }
