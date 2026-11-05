@@ -4,7 +4,7 @@ compatibility_date = "2025-01-01"
 
 [vars]
 # Pages allowed to connect (comma separated, no trailing slash)
-ALLOWED_ORIGINS = "https://tlsdbgh5-cloud.github.io"
+ALLOWED_ORIGINS = "https://tlsdbgh5-cloud.github.io,https://momstay.pages.dev"
 
 [[durable_objects.bindings]]
 name = "ROOM"
