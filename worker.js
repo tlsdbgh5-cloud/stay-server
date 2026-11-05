@@ -1,9 +1,9 @@
 // Stay realtime server: one Durable Object per world ("room").
 // It relays positions and small events, and keeps the note/story boards of that world.
-const WORLDS = ["nurse2", "nurse3", "cafe"];
-const isMom = (w) => w === "nurse2" || w === "nurse3";   // 엄마방 and 엄마방2: separate rooms, same rules
+const WORLDS = ["nurse2", "nurse3", "home", "cafe"];
+const isMom = (w) => w === "nurse2" || w === "nurse3" || w === "home";   // 엄마방, 엄마방2 and 우리집: separate rooms, same rules (lamps/photos/cheers)
 const MAX_PER_ROOM = 120;
-const TOPICS = new Set(["busk", "bow", "clap", "cheers", "chat", "pet", "firework", "log", "pour", "lantern"]);
+const TOPICS = new Set(["busk", "bow", "clap", "cheers", "chat", "pet", "firework", "log", "pour", "lantern", "shout", "punch", "scr"]);
 const NOTE_COLORS = new Set(["yellow", "pink", "mint", "sky", "lilac"]);
 const NOTE_MAX = 140, STORY_MAX = 300;
 const BAD = ["씨발", "시발", "ㅅㅂ", "병신", "ㅂㅅ", "좆", "개새", "미친년", "미친놈", "fuck", "shit"];
@@ -66,6 +66,7 @@ export class Room {
     this.dbDirty = new Set();
     this.lastAdd = new Map();   // uid -> time
     this.db = { notes: [], stories: [], lamps: [] };
+    this.scr = [];              // the last few lines on 엄마방's big screen (memory only)
     state.blockConcurrencyWhile(async () => {
       const d = await state.storage.get("db");
       if (d) this.db = { notes: d.notes || [], stories: d.stories || [], lamps: d.lamps || [] };
@@ -88,12 +89,12 @@ export class Room {
     const snap = [];
     this.conns.forEach((o) => { if (o !== c && o.pres) snap.push(JSON.stringify(o.id) + ":" + o.pres); });
     this.send(c, '{"t":"snap","p":{' + snap.join(",") + "}}");
-    this.sendDb(c, "notes"); if (isMom(world)) { this.sendDb(c, "stories"); this.sendDb(c, "lamps"); }
+    this.sendDb(c, "notes"); if (isMom(world)) { this.sendDb(c, "stories"); this.sendDb(c, "lamps"); if (this.scr.length) this.send(c, JSON.stringify({ t: "e", f: "", k: "scrh", d: { l: this.scr } })); }
     server.addEventListener("message", (ev) => this.onMessage(c, ev.data));
     const drop = () => this.drop(c);
     server.addEventListener("close", drop);
     server.addEventListener("error", drop);
-    if (!this.timer) this.timer = setInterval(() => this.tick(), 300);
+    if (!this.timer) this.timer = setInterval(() => this.tick(), 120);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -133,6 +134,8 @@ export class Room {
       if (js.length > 300) return;
       if (m.k === "chat") { if (typeof d.text !== "string" || bad(d.text)) return; }
       if (m.k === "lantern" && typeof d.text === "string" && bad(d.text)) return;
+      if (m.k === "scr") { if (!isMom(c.world) || typeof d.text !== "string" || !d.text.trim() || d.text.length > 30 || bad(d.text)) return; this.scr.push(clean(d.text, 30)); if (this.scr.length > 20) this.scr.shift(); }
+      if (m.k === "shout") { if (typeof d.text !== "string" || d.text.length > 24 || bad(d.text)) return; }
       const out = '{"t":"e","f":' + JSON.stringify(c.id) + ',"k":' + JSON.stringify(m.k) + ',"d":' + js + "}";
       this.conns.forEach((o) => { if (o !== c) this.send(o, out); });
     } else if (m.t === "add" || m.t === "upd" || m.t === "del") {
@@ -179,8 +182,8 @@ export class Room {
       });
       this.pending.clear(); this.gone = [];
     }
-    if (this.tickN % 80 === 0) this.conns.forEach((o) => this.send(o, '{"t":"k"}'));   // keep-alive
-    if (this.tickN % 200 === 0 && this.sweepLamps()) this.markDb("lamps");
+    if (this.tickN % 200 === 0) this.conns.forEach((o) => this.send(o, '{"t":"k"}'));   // keep-alive
+    if (this.tickN % 500 === 0 && this.sweepLamps()) this.markDb("lamps");
   }
 
   // ---- boards ----
